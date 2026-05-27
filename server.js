@@ -104,17 +104,18 @@ app.get('/download', (req, res) => {
   const ext     = isAudio ? 'mp3' : 'mp4';
   const mime    = isAudio ? 'audio/mpeg' : 'video/mp4';
 
-  const args = [
+    const args = [
     '--ffmpeg-location', FFMPEG_BIN,
     '-f', buildFormatSelector(quality),
     '--merge-output-format', ext,
-    '-o', '-',                            // stream to stdout
+    '-o', '-',
     '--no-playlist',
     '--no-warnings',
     '--no-progress',
     '--quiet',
-    // make MP4 streamable (moov atom at start)
-    ...(isAudio ? [] : ['--postprocessor-args', 'ffmpeg:-movflags +faststart']),
+    // frag_keyframe+empty_moov writes valid MP4 to stdout without seeking
+    // (faststart needs to seek backwards — impossible on a pipe, causes ffmpeg to fail)
+    ...(isAudio ? [] : ['--postprocessor-args', 'ffmpeg:-movflags frag_keyframe+empty_moov']),
     url,
   ];
 
