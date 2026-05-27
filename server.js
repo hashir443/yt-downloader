@@ -68,10 +68,17 @@ app.post('/info', (req, res) => {
   const url = (req.body?.url || '').trim();
   if (!url) return res.status(400).json({ error: 'url required' });
 
-  execFile(YTDLP, ['-J', '--no-playlist', url],
-    { timeout: 30_000, maxBuffer: 20 * 1024 * 1024 },
+  execFile(YTDLP, ['-J', '--no-playlist', '--no-warnings', url],
+    { timeout: 60_000, maxBuffer: 20 * 1024 * 1024 },
     (err, stdout, stderr) => {
-      if (err) return res.status(500).json({ error: err.message, detail: stderr.slice(-500) });
+      if (err) {
+        const ytErr = (stderr || '').split('\n')
+          .find(l => l.includes('ERROR:'))?.replace(/.*ERROR:\s*/, '').trim()
+          || (stderr || '').slice(-300)
+          || err.message;
+        console.error('[info] yt-dlp error:', ytErr);
+        return res.status(500).json({ error: ytErr });
+      }
       let data;
       try { data = JSON.parse(stdout); }
       catch { return res.status(500).json({ error: 'Failed to parse metadata' }); }
@@ -120,8 +127,12 @@ app.get('/download', (req, res) => {
 
   execFile(YTDLP, args, { timeout: 300_000, maxBuffer: 50 * 1024 * 1024 }, (err, _stdout, stderr) => {
     if (err) {
-      console.error('[download] yt-dlp error:', stderr.slice(-800));
-      return res.status(500).json({ error: 'Download failed', detail: stderr.slice(-800) });
+      const ytErr = (stderr || '').split('\n')
+        .find(l => l.includes('ERROR:'))?.replace(/.*ERROR:\s*/, '').trim()
+        || (stderr || '').slice(-500)
+        || err.message;
+      console.error('[download] yt-dlp error:', ytErr);
+      return res.status(500).json({ error: ytErr });
     }
 
     const files = fs.readdirSync(os.tmpdir())
