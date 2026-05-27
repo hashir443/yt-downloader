@@ -1,13 +1,12 @@
 'use strict';
-const express      = require('express');
-const cors         = require('cors');
-const { execFile } = require('child_process');
-const path         = require('path');
-const fs           = require('fs');
-const os           = require('os');
-const crypto       = require('crypto');
+const express              = require('express');
+const cors                 = require('cors');
+const { execFile, spawn }  = require('child_process');
+const path                 = require('path');
+const fs                   = require('fs');
+const crypto               = require('crypto');
 
-// ── ffmpeg: system install first (from apt-get), static binary as fallback ────
+// ── ffmpeg: prefer system install, ffmpeg-static fallback ─────────────────────
 const FFMPEG_BIN = (() => {
   for (const p of ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg']) {
     if (fs.existsSync(p)) { console.log('ffmpeg (system):', p); return p; }
@@ -30,7 +29,7 @@ if (FFMPEG_BIN) {
   );
 }
 
-// ── yt-dlp (downloaded automatically on first startup) ────────────────────────
+// ── yt-dlp (auto-downloaded on first startup) ─────────────────────────────────
 const IS_WIN    = process.platform === 'win32';
 const YTDLP     = path.join(__dirname, IS_WIN ? 'yt-dlp.exe' : 'yt-dlp');
 const YTDLP_URL = `https://github.com/yt-dlp/yt-dlp/releases/latest/download/${IS_WIN ? 'yt-dlp.exe' : 'yt-dlp'}`;
@@ -55,7 +54,7 @@ function buildFormatSelector(quality) {
   if (quality === 'audio') return 'bestaudio[ext=m4a]/bestaudio';
   const h = parseInt(quality, 10);
   if (!h) return 'bestvideo+bestaudio';
-  // No single-stream fallback — if merge fails we get a real error, not silent audio-only
+  // No single-stream fallback — prevents silent audio-only downloads
   return `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio`;
 }
 
@@ -69,7 +68,7 @@ app.post('/info', (req, res) => {
   const url = (req.body?.url || '').trim();
   if (!url) return res.status(400).json({ error: 'url required' });
 
-  execFile(YTDLP, ['-J', '--no-playlist', url], { timeout: 30_000 }, (err, stdout, stderr) => {
+  execFile(YTDLP, ['-J', '--no-playlist', url], { timeout: 30_000, maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
     if (err) return res.status(500).json({ error: err.message, detail: stderr.slice(-500) });
 
     let data;
@@ -94,60 +93,68 @@ app.post('/info', (req, res) => {
   });
 });
 
-// GET /download
+// GET /download — streams yt-dlp stdout directly (no temp file, no idle timeout)
 app.get('/download', (req, res) => {
   const url     = (req.query.url     || '').trim();
   const quality = (req.query.quality || '').trim();
   if (!url || !quality) return res.status(400).json({ error: 'url and quality required' });
-  if (!FFMPEG_BIN) return res.status(500).json({ error: 'ffmpeg not installed — add apt-get install -y ffmpeg to Render build command' });
+  if (!FFMPEG_BIN)      return res.status(500).json({ error: 'ffmpeg not installed' });
 
-  const sessionId = crypto.randomUUID();
-  const tmpOut    = path.join(os.tmpdir(), `${sessionId}.%(ext)s`);
-  const isAudio   = quality === 'audio';
-  const mergeFmt  = isAudio ? 'mp3' : 'mp4';
+  const isAudio = quality === 'audio';
+  const ext     = isAudio ? 'mp3' : 'mp4';
+  const mime    = isAudio ? 'audio/mpeg' : 'video/mp4';
 
   const args = [
     '--ffmpeg-location', FFMPEG_BIN,
     '-f', buildFormatSelector(quality),
-    '--merge-output-format', mergeFmt,
-    '-o', tmpOut,
+    '--merge-output-format', ext,
+    '-o', '-',                            // stream to stdout
     '--no-playlist',
     '--no-warnings',
+    '--no-progress',
+    '--quiet',
+    // make MP4 streamable (moov atom at start)
+    ...(isAudio ? [] : ['--postprocessor-args', 'ffmpeg:-movflags +faststart']),
     url,
   ];
 
-  console.log('[download] quality=%s ffmpeg=%s', quality, path.basename(FFMPEG_BIN));
+  console.log('[download] quality=%s url=%s', quality, url.slice(0, 60));
 
-  execFile(YTDLP, args, { timeout: 300_000 }, (err, _stdout, stderr) => {
-    if (err) {
-      console.error('[download] yt-dlp error:', stderr.slice(-800));
-      return res.status(500).json({ error: 'Download failed', detail: stderr.slice(-800) });
+  // Set headers up-front so the response starts flowing immediately
+  res.setHeader('Content-Disposition', `attachment; filename="video.${ext}"`);
+  res.setHeader('Content-Type', mime);
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
+  res.setHeader('Cache-Control', 'no-store');
+
+  const child = spawn(YTDLP, args);
+  let bytes = 0;
+  let stderrTail = '';
+
+  child.stderr.on('data', (d) => {
+    stderrTail = (stderrTail + d.toString()).slice(-2000);
+  });
+
+  child.stdout.on('data', (chunk) => { bytes += chunk.length; });
+  child.stdout.pipe(res);
+
+  child.on('error', (err) => {
+    console.error('[download] spawn error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Spawn failed', detail: err.message });
+    res.end();
+  });
+
+  child.on('close', (code) => {
+    console.log('[download] exit=%d bytes=%d', code, bytes);
+    if (code !== 0) console.error('[download] stderr:', stderrTail.slice(-600));
+    res.end();
+  });
+
+  // Kill yt-dlp if user cancels
+  res.on('close', () => {
+    if (!child.killed) {
+      console.log('[download] client closed connection, killing yt-dlp');
+      child.kill('SIGTERM');
     }
-
-    const files = fs.readdirSync(os.tmpdir())
-      .filter(f => f.startsWith(sessionId) && !f.endsWith('.part') && !f.endsWith('.ytdl'))
-      .map(f => path.join(os.tmpdir(), f));
-
-    const outFile = files[0];
-    if (!outFile || !fs.existsSync(outFile)) {
-      console.error('[download] file missing. stderr:', stderr.slice(-300));
-      return res.status(500).json({ error: 'File not found after download', detail: stderr.slice(-300) });
-    }
-
-    const ext  = path.extname(outFile).slice(1) || mergeFmt;
-    const mime = ext === 'mp3' ? 'audio/mpeg' : 'video/mp4';
-    const size = fs.statSync(outFile).size;
-
-    console.log('[download] streaming %.1f MB as .%s', size / 1e6, ext);
-
-    res.setHeader('Content-Disposition', `attachment; filename="video.${ext}"`);
-    res.setHeader('Content-Type', mime);
-    res.setHeader('Content-Length', size);
-    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
-
-    const stream = fs.createReadStream(outFile);
-    stream.pipe(res);
-    stream.on('close', () => fs.unlink(outFile, () => {}));
   });
 });
 
