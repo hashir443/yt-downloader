@@ -7,59 +7,111 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// yt-dlp local path (IMPORTANT for Render)
+const YTDLP = "./yt-dlp";
+
 /**
- * GET VIDEO INFO + FORMATS
+ * =========================
+ *  GET VIDEO INFO + FORMATS
+ * =========================
  */
 app.post("/info", (req, res) => {
 
     const url = req.body.url;
 
-    exec(`yt-dlp -J "${url}"`, (err, stdout) => {
+    if (!url) {
+        return res.status(400).json({ error: "URL is required" });
+    }
+
+    const cmd = `${YTDLP} -J "${url}"`;
+
+    exec(cmd, (err, stdout, stderr) => {
 
         if (err) {
-            return res.status(500).json({ error: err.message });
+            return res.status(500).json({
+                error: stderr || err.message
+            });
         }
 
-        const data = JSON.parse(stdout);
+        try {
+            const data = JSON.parse(stdout);
 
-        const formats = data.formats
-            .filter(f => f.vcodec !== "none" && f.height)
-            .map(f => ({
-                formatId: f.format_id,
-                quality: f.height + "p",
-                ext: f.ext
-            }));
+            // Clean format list (only video formats with height)
+            const formats = (data.formats || [])
+                .filter(f =>
+                    f.vcodec !== "none" &&
+                    f.height
+                )
+                .map(f => ({
+                    formatId: f.format_id,
+                    quality: `${f.height}p`,
+                    ext: f.ext
+                }))
+                // remove duplicates (optional cleanup)
+                .filter((v, i, a) =>
+                    a.findIndex(t => t.quality === v.quality) === i
+                );
 
-        res.json({
-            title: data.title,
-            thumbnail: data.thumbnail,
-            formats
-        });
+            return res.json({
+                title: data.title,
+                thumbnail: data.thumbnail,
+                formats
+            });
 
+        } catch (e) {
+            return res.status(500).json({
+                error: "Failed to parse yt-dlp response"
+            });
+        }
     });
-
 });
 
 
 /**
- * DOWNLOAD SELECTED FORMAT
+ * =========================
+ *  DOWNLOAD SELECTED FORMAT
+ * =========================
  */
 app.get("/download", (req, res) => {
 
     const url = req.query.url;
     const format = req.query.format;
 
+    if (!url || !format) {
+        return res.status(400).send("Missing url or format");
+    }
+
     res.setHeader(
         "Content-Disposition",
         'attachment; filename="video.mp4"'
     );
 
-    const process = exec(`yt-dlp -f ${format} -o - "${url}"`);
+    // BEST STREAMING COMMAND
+    const cmd = `${YTDLP} -f ${format} -o - "${url}"`;
+
+    const process = exec(cmd, { maxBuffer: 1024 * 1024 * 500 });
 
     process.stdout.pipe(res);
 
+    process.stderr.on("data", (data) => {
+        console.log("yt-dlp:", data.toString());
+    });
+
 });
 
-app.listen(3000, () => {
-    console.log("Server running on port 3000");
+
+/**
+ * =========================
+ *  HEALTH CHECK
+ * =========================
+ */
+app.get("/", (req, res) => {
+    res.send("YT Downloader API running 🚀");
+});
+
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+    console.log("Server running on port", PORT);
 });
