@@ -3,115 +3,101 @@ const cors = require("cors");
 const { exec } = require("child_process");
 
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 
-// yt-dlp local path (IMPORTANT for Render)
 const YTDLP = "./yt-dlp";
 
-/**
- * =========================
- *  GET VIDEO INFO + FORMATS
- * =========================
- */
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+function isYouTubeUrl(url) {
+  return /^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//.test(url);
+}
+
+function isValidFormatId(id) {
+  return /^[a-zA-Z0-9_\-+]+$/.test(id);
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return null;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// ── GET video info + formats ─────────────────────────────────────────────────
+
 app.post("/info", (req, res) => {
+  const url = req.body.url;
+  if (!url) return res.status(400).json({ error: "URL is required" });
+  if (!isYouTubeUrl(url)) return res.status(400).json({ error: "Only YouTube URLs are supported" });
 
-    const url = req.body.url;
+  exec(`${YTDLP} -J "${url}"`, { timeout: 30000 }, (err, stdout, stderr) => {
+    if (err) return res.status(500).json({ error: stderr || err.message });
 
-    if (!url) {
-        return res.status(400).json({ error: "URL is required" });
+    let data;
+    try { data = JSON.parse(stdout); } catch {
+      return res.status(500).json({ error: "Failed to parse yt-dlp response" });
     }
 
-    const cmd = `${YTDLP} -J "${url}"`;
+    // Combined video+audio only (both codecs present)
+    const videoFormats = (data.formats || [])
+      .filter(f => f.vcodec !== "none" && f.acodec !== "none" && f.height)
+      .map(f => ({
+        formatId: f.format_id,
+        quality: `${f.height}p`,
+        ext: f.ext,
+        type: "video",
+        filesize: formatBytes(f.filesize || f.filesize_approx),
+      }))
+      .filter((v, i, a) => a.findIndex(t => t.quality === v.quality) === i)
+      .sort((a, b) => parseInt(b.quality) - parseInt(a.quality));
 
-    exec(cmd, (err, stdout, stderr) => {
+    // Best audio-only format
+    const audioFormats = (data.formats || [])
+      .filter(f => f.vcodec === "none" && f.acodec && f.acodec !== "none")
+      .sort((a, b) => (b.abr || 0) - (a.abr || 0));
 
-        if (err) {
-            return res.status(500).json({
-                error: stderr || err.message
-            });
-        }
+    const formats = [...videoFormats];
+    if (audioFormats.length) {
+      const best = audioFormats[0];
+      formats.push({
+        formatId: best.format_id,
+        quality: "Audio only",
+        ext: best.ext,
+        type: "audio",
+        filesize: formatBytes(best.filesize || best.filesize_approx),
+      });
+    }
 
-        try {
-            const data = JSON.parse(stdout);
-
-            // Clean format list (only video formats with height)
-            const formats = (data.formats || [])
-                .filter(f =>
-                    f.vcodec !== "none" &&
-                    f.height
-                )
-                .map(f => ({
-                    formatId: f.format_id,
-                    quality: `${f.height}p`,
-                    ext: f.ext
-                }))
-                // remove duplicates (optional cleanup)
-                .filter((v, i, a) =>
-                    a.findIndex(t => t.quality === v.quality) === i
-                );
-
-            return res.json({
-                title: data.title,
-                thumbnail: data.thumbnail,
-                formats
-            });
-
-        } catch (e) {
-            return res.status(500).json({
-                error: "Failed to parse yt-dlp response"
-            });
-        }
+    res.json({
+      title: data.title,
+      thumbnail: data.thumbnail,
+      channel: data.uploader || data.channel || "",
+      formats,
     });
+  });
 });
 
+// ── stream download ──────────────────────────────────────────────────────────
 
-/**
- * =========================
- *  DOWNLOAD SELECTED FORMAT
- * =========================
- */
 app.get("/download", (req, res) => {
+  const { url, format } = req.query;
+  if (!url || !format) return res.status(400).send("Missing url or format");
+  if (!isYouTubeUrl(url)) return res.status(400).send("Invalid URL");
+  if (!isValidFormatId(format)) return res.status(400).send("Invalid format");
 
-    const url = req.query.url;
-    const format = req.query.format;
+  const ext = format.includes("audio") ? "m4a" : "mp4";
+  res.setHeader("Content-Disposition", `attachment; filename="video.${ext}"`);
 
-    if (!url || !format) {
-        return res.status(400).send("Missing url or format");
-    }
-
-    res.setHeader(
-        "Content-Disposition",
-        'attachment; filename="video.mp4"'
-    );
-
-    // BEST STREAMING COMMAND
-    const cmd = `${YTDLP} -f ${format} -o - "${url}"`;
-
-    const process = exec(cmd, { maxBuffer: 1024 * 1024 * 500 });
-
-    process.stdout.pipe(res);
-
-    process.stderr.on("data", (data) => {
-        console.log("yt-dlp:", data.toString());
-    });
-
+  const proc = exec(`${YTDLP} -f ${format} -o - "${url}"`, { maxBuffer: 1024 * 1024 * 500 });
+  proc.stdout.pipe(res);
+  proc.stderr.on("data", d => console.log("yt-dlp:", d.toString()));
+  proc.on("error", () => res.end());
 });
 
+// ── health check ─────────────────────────────────────────────────────────────
 
-/**
- * =========================
- *  HEALTH CHECK
- * =========================
- */
-app.get("/", (req, res) => {
-    res.send("YT Downloader API running 🚀");
-});
-
+app.get("/", (req, res) => res.send("YT Downloader API running"));
 
 const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-    console.log("Server running on port", PORT);
-});
+app.listen(PORT, () => console.log("Server running on port", PORT));
