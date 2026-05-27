@@ -50,6 +50,28 @@ async function ensureYtDlp() {
   console.log('yt-dlp ready');
 }
 
+// ── YouTube cookies ───────────────────────────────────────────────────────────
+// Set YOUTUBE_COOKIES env var in Render with the full contents of a cookies.txt
+// file exported from your browser while logged in to YouTube.
+const COOKIES_FILE = path.join(os.tmpdir(), 'yt-cookies.txt');
+const HAS_COOKIES = (() => {
+  const raw = process.env.YOUTUBE_COOKIES;
+  if (!raw) { console.log('YOUTUBE_COOKIES not set — unauthenticated requests only'); return false; }
+  try {
+    // Render stores multiline values with literal \n — normalise both cases
+    fs.writeFileSync(COOKIES_FILE, raw.replace(/\\n/g, '\n'));
+    console.log('YouTube cookies written to', COOKIES_FILE);
+    return true;
+  } catch (e) {
+    console.error('Failed to write cookies file:', e.message);
+    return false;
+  }
+})();
+
+function cookieArgs() {
+  return HAS_COOKIES ? ['--cookies', COOKIES_FILE] : [];
+}
+
 // ── format selector ───────────────────────────────────────────────────────────
 function buildFormatSelector(quality) {
   if (quality === 'audio') return 'bestaudio[ext=m4a]/bestaudio';
@@ -68,7 +90,7 @@ app.post('/info', (req, res) => {
   const url = (req.body?.url || '').trim();
   if (!url) return res.status(400).json({ error: 'url required' });
 
-  execFile(YTDLP, ['-J', '--no-playlist', '--no-warnings', url],
+  execFile(YTDLP, ['-J', '--no-playlist', '--no-warnings', ...cookieArgs(), url],
     { timeout: 60_000, maxBuffer: 20 * 1024 * 1024 },
     (err, stdout, stderr) => {
       if (err) {
@@ -120,6 +142,7 @@ app.get('/download', (req, res) => {
     '-o', tmpOut,
     '--no-playlist',
     '--no-warnings',
+    ...cookieArgs(),
     url,
   ];
 
