@@ -76,8 +76,9 @@ function cookieArgs() {
 function buildFormatSelector(quality) {
   if (quality === 'audio') return 'bestaudio[ext=m4a]/bestaudio';
   const h = parseInt(quality, 10);
-  if (!h) return 'bestvideo+bestaudio';
-  return `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio`;
+  if (!h) return 'bestvideo+bestaudio/best';
+  // No [ext=mp4] filter — YouTube 1080p+ is often WebM/VP9; ffmpeg merges to mp4 regardless
+  return `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`;
 }
 
 // ── app ───────────────────────────────────────────────────────────────────────
