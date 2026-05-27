@@ -1,11 +1,13 @@
 'use strict';
 const express      = require('express');
 const cors         = require('cors');
-const { execFile, spawn } = require('child_process');
+const { execFile } = require('child_process');
 const path         = require('path');
 const fs           = require('fs');
 const os           = require('os');
 const crypto       = require('crypto');
+const https        = require('https');
+const http         = require('http');
 
 // ── ffmpeg ────────────────────────────────────────────────────────────────────
 const FFMPEG_BIN = (() => {
@@ -104,7 +106,6 @@ app.get('/download', (req, res) => {
   const isAudio   = quality === 'audio';
   const mergeFmt  = isAudio ? 'mp3' : 'mp4';
 
-  // No stdout pipe, no fragmented flags — write a standard seekable file
   const args = [
     '--ffmpeg-location', FFMPEG_BIN,
     '-f', buildFormatSelector(quality),
@@ -117,14 +118,12 @@ app.get('/download', (req, res) => {
 
   console.log('[download] quality=%s url=%s', quality, url.slice(0, 60));
 
-  // Large maxBuffer so verbose yt-dlp stderr never overflows
   execFile(YTDLP, args, { timeout: 300_000, maxBuffer: 50 * 1024 * 1024 }, (err, _stdout, stderr) => {
     if (err) {
       console.error('[download] yt-dlp error:', stderr.slice(-800));
       return res.status(500).json({ error: 'Download failed', detail: stderr.slice(-800) });
     }
 
-    // yt-dlp picks the actual extension — scan tmpdir
     const files = fs.readdirSync(os.tmpdir())
       .filter(f => f.startsWith(sessionId) && !f.endsWith('.part') && !f.endsWith('.ytdl'))
       .map(f => path.join(os.tmpdir(), f));
@@ -156,15 +155,70 @@ app.get('/download', (req, res) => {
   });
 });
 
-// GET /direct-url (Instagram / Facebook)
+// GET /direct-url — resolves CDN URL(s) via yt-dlp -g (Instagram / Facebook)
 app.get('/direct-url', (req, res) => {
   const url = (req.query.url || '').trim();
   if (!url) return res.status(400).json({ error: 'url required' });
 
-  execFile(YTDLP, ['-g', '--no-playlist', url], { timeout: 30_000 }, (err, stdout, stderr) => {
-    if (err) return res.status(500).json({ error: err.message, detail: stderr.slice(-300) });
-    const lines = stdout.trim().split('\n').filter(Boolean);
-    res.json({ url: lines[0], allUrls: lines });
+  execFile(YTDLP, ['-g', '--no-playlist', '--no-warnings', url],
+    { timeout: 30_000, maxBuffer: 2 * 1024 * 1024 },
+    (err, stdout, stderr) => {
+      const lines = (stdout || '').trim().split('\n').filter(Boolean);
+      if (err || lines.length === 0) {
+        const errLine = (stderr || '').trim().split('\n')
+          .find(l => l.includes('ERROR:'))?.replace('ERROR:', '').trim()
+          || err?.message
+          || 'Failed to extract video URL';
+        console.error('[direct-url] error:', errLine);
+        return res.status(500).json({ error: errLine });
+      }
+      res.json({ url: lines[0], allUrls: lines });
+    }
+  );
+});
+
+// GET /social-download — proxies a CDN video URL through the server so the
+// browser receives Content-Disposition: attachment and saves it to disk
+// instead of playing it inline in a new tab.
+app.get('/social-download', (req, res) => {
+  const cdnUrl = (req.query.cdnUrl || '').trim();
+  if (!cdnUrl) return res.status(400).json({ error: 'cdnUrl required' });
+
+  console.log('[social-download] proxying:', cdnUrl.slice(0, 80));
+
+  const proto = cdnUrl.startsWith('https') ? https : http;
+  const upstream = proto.get(
+    cdnUrl,
+    {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer':    'https://www.instagram.com/',
+      },
+    },
+    (upRes) => {
+      if (upRes.statusCode >= 400) {
+        console.error('[social-download] CDN error:', upRes.statusCode);
+        if (!res.headersSent) res.status(502).json({ error: `CDN returned ${upRes.statusCode}` });
+        return;
+      }
+
+      const ct = upRes.headers['content-type'] || 'video/mp4';
+      const cl = upRes.headers['content-length'];
+
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Content-Disposition', 'attachment; filename="video.mp4"');
+      res.setHeader('Content-Type', ct);
+      if (cl) res.setHeader('Content-Length', cl);
+
+      upRes.pipe(res);
+
+      res.on('close', () => { if (!res.writableEnded) upRes.destroy(); });
+    }
+  );
+
+  upstream.on('error', (e) => {
+    console.error('[social-download] request error:', e.message);
+    if (!res.headersSent) res.status(502).json({ error: e.message });
   });
 });
 
