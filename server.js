@@ -9,7 +9,6 @@ const crypto       = require('crypto');
 const https        = require('https');
 const http         = require('http');
 
-// ── ffmpeg ────────────────────────────────────────────────────────────────────
 const FFMPEG_BIN = (() => {
   for (const p of ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg']) {
     if (fs.existsSync(p)) { console.log('ffmpeg (system):', p); return p; }
@@ -32,7 +31,6 @@ if (FFMPEG_BIN) {
   );
 }
 
-// ── yt-dlp ────────────────────────────────────────────────────────────────────
 const IS_WIN    = process.platform === 'win32';
 const YTDLP     = path.join(__dirname, IS_WIN ? 'yt-dlp.exe' : 'yt-dlp');
 const YTDLP_URL = `https://github.com/yt-dlp/yt-dlp/releases/latest/download/${IS_WIN ? 'yt-dlp.exe' : 'yt-dlp'}`;
@@ -50,15 +48,11 @@ async function ensureYtDlp() {
   console.log('yt-dlp ready');
 }
 
-// ── YouTube cookies ───────────────────────────────────────────────────────────
-// Set YOUTUBE_COOKIES env var in Render with the full contents of a cookies.txt
-// file exported from your browser while logged in to YouTube.
 const COOKIES_FILE = path.join(os.tmpdir(), 'yt-cookies.txt');
 const HAS_COOKIES = (() => {
   const raw = process.env.YOUTUBE_COOKIES;
   if (!raw) { console.log('YOUTUBE_COOKIES not set — unauthenticated requests only'); return false; }
   try {
-    // Render stores multiline values with literal \n — normalise both cases
     fs.writeFileSync(COOKIES_FILE, raw.replace(/\\n/g, '\n'));
     console.log('YouTube cookies written to', COOKIES_FILE);
     return true;
@@ -72,26 +66,31 @@ function cookieArgs() {
   return HAS_COOKIES ? ['--cookies', COOKIES_FILE] : [];
 }
 
-// ── format selector ───────────────────────────────────────────────────────────
-function buildFormatSelector(quality) {
-  if (quality === 'audio') return 'bestaudio[ext=m4a]/bestaudio';
+// iOS + web player clients bypass YouTube bot-detection format restrictions
+// that block the default web client even with valid cookies (yt-dlp 2025+).
+const YT_CLIENT_ARGS = ['--extractor-args', 'youtube:player_client=ios,web'];
+
+function buildFormatSelector(quality, fmtId) {
+  if (quality === 'audio') {
+    return fmtId ? `${fmtId}/bestaudio[ext=m4a]/bestaudio` : 'bestaudio[ext=m4a]/bestaudio';
+  }
   const h = parseInt(quality, 10);
+  if (fmtId) {
+    return `${fmtId}+bestaudio[ext=m4a]/${fmtId}+bestaudio/bestvideo[height<=${h || 1080}]+bestaudio/best`;
+  }
   if (!h) return 'bestvideo+bestaudio/best';
-  // No [ext=mp4] filter — YouTube 1080p+ is often WebM/VP9; ffmpeg merges to mp4 regardless
   return `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`;
 }
 
-// ── app ───────────────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// POST /info
 app.post('/info', (req, res) => {
   const url = (req.body?.url || '').trim();
   if (!url) return res.status(400).json({ error: 'url required' });
 
-  execFile(YTDLP, ['-J', '--no-playlist', '--no-warnings', ...cookieArgs(), url],
+  execFile(YTDLP, ['-J', '--no-playlist', '--no-warnings', ...YT_CLIENT_ARGS, ...cookieArgs(), url],
     { timeout: 60_000, maxBuffer: 20 * 1024 * 1024 },
     (err, stdout, stderr) => {
       if (err) {
@@ -106,28 +105,34 @@ app.post('/info', (req, res) => {
       try { data = JSON.parse(stdout); }
       catch { return res.status(500).json({ error: 'Failed to parse metadata' }); }
 
-      const heights = [...new Set(
-        (data.formats || [])
-          .filter(f => f.height && f.vcodec && f.vcodec !== 'none')
-          .map(f => f.height),
-      )].sort((a, b) => b - a);
+      const videoFmtMap = {};
+      (data.formats || [])
+        .filter(f => f.height && f.vcodec && f.vcodec !== 'none')
+        .sort((a, b) => (b.tbr || b.vbr || 0) - (a.tbr || a.vbr || 0))
+        .forEach(f => { if (!videoFmtMap[f.height]) videoFmtMap[f.height] = f.format_id; });
+
+      const heights = Object.keys(videoFmtMap).map(Number).sort((a, b) => b - a);
+
+      const bestAudio = (data.formats || [])
+        .filter(f => (!f.vcodec || f.vcodec === 'none') && f.acodec && f.acodec !== 'none')
+        .sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0))[0];
 
       res.json({
         title:     data.title     || 'Unknown',
         thumbnail: data.thumbnail || '',
         channel:   data.uploader  || data.channel || '',
         formats: [
-          ...heights.map(h => ({ quality: String(h), label: `${h}p`, type: 'video' })),
-          { quality: 'audio', label: 'Audio only', type: 'audio' },
+          ...heights.map(h => ({ quality: String(h), fmtId: videoFmtMap[h], label: `${h}p`, type: 'video' })),
+          { quality: 'audio', fmtId: bestAudio?.format_id, label: 'Audio only', type: 'audio' },
         ],
       });
     });
 });
 
-// GET /download — writes to temp file (standard MP4), then streams
 app.get('/download', (req, res) => {
   const url     = (req.query.url     || '').trim();
   const quality = (req.query.quality || '').trim();
+  const fmtId   = (req.query.fmtId   || '').trim();
   if (!url || !quality) return res.status(400).json({ error: 'url and quality required' });
   if (!FFMPEG_BIN)      return res.status(500).json({ error: 'ffmpeg not installed' });
 
@@ -138,16 +143,17 @@ app.get('/download', (req, res) => {
 
   const args = [
     '--ffmpeg-location', FFMPEG_BIN,
-    '-f', buildFormatSelector(quality),
+    '-f', buildFormatSelector(quality, fmtId),
     '--merge-output-format', mergeFmt,
     '-o', tmpOut,
     '--no-playlist',
     '--no-warnings',
+    ...YT_CLIENT_ARGS,
     ...cookieArgs(),
     url,
   ];
 
-  console.log('[download] quality=%s url=%s', quality, url.slice(0, 60));
+  console.log('[download] quality=%s fmtId=%s url=%s', quality, fmtId, url.slice(0, 60));
 
   execFile(YTDLP, args, { timeout: 300_000, maxBuffer: 50 * 1024 * 1024 }, (err, _stdout, stderr) => {
     if (err) {
@@ -190,7 +196,6 @@ app.get('/download', (req, res) => {
   });
 });
 
-// GET /direct-url — resolves CDN URL(s) via yt-dlp -g (Instagram / Facebook)
 app.get('/direct-url', (req, res) => {
   const url = (req.query.url || '').trim();
   if (!url) return res.status(400).json({ error: 'url required' });
@@ -212,9 +217,6 @@ app.get('/direct-url', (req, res) => {
   );
 });
 
-// GET /social-download — proxies a CDN video URL through the server so the
-// browser receives Content-Disposition: attachment and saves it to disk
-// instead of playing it inline in a new tab.
 app.get('/social-download', (req, res) => {
   const cdnUrl = (req.query.cdnUrl || '').trim();
   if (!cdnUrl) return res.status(400).json({ error: 'cdnUrl required' });
@@ -246,7 +248,6 @@ app.get('/social-download', (req, res) => {
       if (cl) res.setHeader('Content-Length', cl);
 
       upRes.pipe(res);
-
       res.on('close', () => { if (!res.writableEnded) upRes.destroy(); });
     }
   );
