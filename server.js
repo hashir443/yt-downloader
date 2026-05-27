@@ -7,9 +7,17 @@ const fs           = require('fs');
 const os           = require('os');
 const crypto       = require('crypto');
 
-// ── yt-dlp standalone binary (no Python needed) ───────────────────────────────
-const IS_WIN  = process.platform === 'win32';
-const YTDLP   = path.join(__dirname, IS_WIN ? 'yt-dlp.exe' : 'yt-dlp');
+// ── ffmpeg (from npm, no system install needed) ────────────────────────────────
+const FFMPEG_BIN = require('ffmpeg-static'); // full path to the binary
+console.log('ffmpeg:', FFMPEG_BIN, '| exists:', fs.existsSync(FFMPEG_BIN));
+// Ensure executable on Linux
+if (process.platform !== 'win32' && fs.existsSync(FFMPEG_BIN)) {
+  try { fs.chmodSync(FFMPEG_BIN, 0o755); } catch {}
+}
+
+// ── yt-dlp (standalone binary, downloaded on first startup) ───────────────────
+const IS_WIN   = process.platform === 'win32';
+const YTDLP    = path.join(__dirname, IS_WIN ? 'yt-dlp.exe' : 'yt-dlp');
 const YTDLP_URL = `https://github.com/yt-dlp/yt-dlp/releases/latest/download/${IS_WIN ? 'yt-dlp.exe' : 'yt-dlp'}`;
 
 async function ensureYtDlp() {
@@ -17,36 +25,29 @@ async function ensureYtDlp() {
     console.log('yt-dlp ready:', YTDLP);
     return;
   }
-  console.log('Downloading yt-dlp from GitHub...');
+  console.log('Downloading yt-dlp...');
   const res = await fetch(YTDLP_URL);
-  if (!res.ok) throw new Error(`Failed to download yt-dlp: ${res.status}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  fs.writeFileSync(YTDLP, buf);
+  if (!res.ok) throw new Error(`yt-dlp download failed: ${res.status}`);
+  fs.writeFileSync(YTDLP, Buffer.from(await res.arrayBuffer()));
   if (!IS_WIN) fs.chmodSync(YTDLP, 0o755);
   console.log('yt-dlp downloaded:', YTDLP);
 }
 
-// ── ffmpeg (from npm package, no install needed) ──────────────────────────────
-const ffmpegPath = require('ffmpeg-static');
-const FFMPEG_DIR = path.dirname(ffmpegPath);
-console.log('ffmpeg:', ffmpegPath);
+// ── helpers ───────────────────────────────────────────────────────────────────
+function buildFormatSelector(quality) {
+  if (quality === 'audio') return 'bestaudio[ext=m4a]/bestaudio';
+  const h = parseInt(quality, 10);
+  if (!h) return 'bestvideo+bestaudio';
+  // NO fallback to best[height<=h] — that silently downloads audio-only on YouTube
+  return `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio`;
+}
 
 // ── app ───────────────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-function buildFormatSelector(quality) {
-  if (quality === 'audio') return 'bestaudio[ext=m4a]/bestaudio';
-  const h = parseInt(quality, 10);
-  if (!h) return 'bestvideo+bestaudio/best';
-  return (
-    `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/` +
-    `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`
-  );
-}
-
-// ── POST /info ────────────────────────────────────────────────────────────────
+// POST /info
 app.post('/info', (req, res) => {
   const url = (req.body?.url || '').trim();
   if (!url) return res.status(400).json({ error: 'url required' });
@@ -76,7 +77,7 @@ app.post('/info', (req, res) => {
   });
 });
 
-// ── GET /download ─────────────────────────────────────────────────────────────
+// GET /download
 app.get('/download', (req, res) => {
   const url     = (req.query.url     || '').trim();
   const quality = (req.query.quality || '').trim();
@@ -88,7 +89,7 @@ app.get('/download', (req, res) => {
   const mergeFmt  = isAudio ? 'mp3' : 'mp4';
 
   const args = [
-    '--ffmpeg-location', FFMPEG_DIR,
+    '--ffmpeg-location', FFMPEG_BIN,   // ← direct binary path, not the folder
     '-f',  buildFormatSelector(quality),
     '--merge-output-format', mergeFmt,
     '-o',  tmpOut,
@@ -97,7 +98,7 @@ app.get('/download', (req, res) => {
     url,
   ];
 
-  console.log('[download] quality=%s', quality);
+  console.log('[download] quality=%s url=%s', quality, url.slice(0, 60));
 
   execFile(YTDLP, args, { timeout: 300_000 }, (err, _stdout, stderr) => {
     if (err) {
@@ -105,7 +106,6 @@ app.get('/download', (req, res) => {
       return res.status(500).json({ error: 'Download failed', detail: stderr.slice(-600) });
     }
 
-    // yt-dlp picks the actual extension — find the file by session prefix
     const files = fs.readdirSync(os.tmpdir())
       .filter(f => f.startsWith(sessionId) && !f.endsWith('.part') && !f.endsWith('.ytdl'))
       .map(f => path.join(os.tmpdir(), f));
@@ -120,7 +120,7 @@ app.get('/download', (req, res) => {
     const mime = ext === 'mp3' ? 'audio/mpeg' : 'video/mp4';
     const size = fs.statSync(outFile).size;
 
-    console.log('[download] streaming %s MB', (size / 1e6).toFixed(1));
+    console.log('[download] streaming %.1f MB as %s', size / 1e6, ext);
 
     res.setHeader('Content-Disposition', `attachment; filename="video.${ext}"`);
     res.setHeader('Content-Type', mime);
@@ -133,7 +133,7 @@ app.get('/download', (req, res) => {
   });
 });
 
-// ── GET /direct-url (Instagram / Facebook) ────────────────────────────────────
+// GET /direct-url (Instagram / Facebook)
 app.get('/direct-url', (req, res) => {
   const url = (req.query.url || '').trim();
   if (!url) return res.status(400).json({ error: 'url required' });
