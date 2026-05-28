@@ -66,9 +66,13 @@ function cookieArgs() {
   return HAS_COOKIES ? ['--cookies', COOKIES_FILE] : [];
 }
 
-// iOS + web player clients bypass YouTube bot-detection format restrictions
-// that block the default web client even with valid cookies (yt-dlp 2025+).
-const YT_CLIENT_ARGS = ['--extractor-args', 'youtube:player_client=ios,web'];
+// tv_embedded client doesn't require po_token and is most reliable on server IPs.
+// --no-check-formats skips CDN URL reachability checks that fail on cloud IPs
+// even when the video itself is fully downloadable.
+const YT_CLIENT_ARGS = [
+  '--extractor-args', 'youtube:player_client=tv_embedded,ios,web',
+  '--no-check-formats',
+];
 
 function buildFormatSelector(quality, fmtId) {
   if (quality === 'audio') {
@@ -238,15 +242,12 @@ app.get('/social-download', (req, res) => {
         if (!res.headersSent) res.status(502).json({ error: `CDN returned ${upRes.statusCode}` });
         return;
       }
-
       const ct = upRes.headers['content-type'] || 'video/mp4';
       const cl = upRes.headers['content-length'];
-
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Content-Disposition', 'attachment; filename="video.mp4"');
       res.setHeader('Content-Type', ct);
       if (cl) res.setHeader('Content-Length', cl);
-
       upRes.pipe(res);
       res.on('close', () => { if (!res.writableEnded) upRes.destroy(); });
     }
