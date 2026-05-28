@@ -147,7 +147,7 @@ app.get('/download', (req, res) => {
 
   const args = [
     '--ffmpeg-location', FFMPEG_BIN,
-    '-f', buildFormatSelector(quality, fmtId),
+    ...buildFormatArgs(quality, fmtId),
     '--merge-output-format', mergeFmt,
     '-o', tmpOut,
     '--no-playlist',
