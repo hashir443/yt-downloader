@@ -74,16 +74,21 @@ const YT_CLIENT_ARGS = [
   '--no-check-formats',
 ];
 
-function buildFormatSelector(quality, fmtId) {
+// Returns extra yt-dlp args for format selection.
+// bv*+ba/b = best video (incl. muxed) + best audio, or best single stream.
+// -S res:N  = sort by resolution closest to N instead of requiring exactly N.
+function buildFormatArgs(quality, fmtId) {
   if (quality === 'audio') {
-    return fmtId ? `${fmtId}/bestaudio[ext=m4a]/bestaudio` : 'bestaudio[ext=m4a]/bestaudio';
+    return ['-f', fmtId ? `${fmtId}/bestaudio` : 'bestaudio'];
   }
   const h = parseInt(quality, 10);
   if (fmtId) {
-    return `${fmtId}+bestaudio[ext=m4a]/${fmtId}+bestaudio/bestvideo[height<=${h || 1080}]+bestaudio/best`;
+    return ['-f', `${fmtId}+bestaudio/${fmtId}/bv*+ba/b`];
   }
-  if (!h) return 'bestvideo+bestaudio/best';
-  return `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`;
+  if (h) {
+    return ['-f', 'bv*+ba/b', '-S', `res:${h}`];
+  }
+  return ['-f', 'bv*+ba/b'];
 }
 
 const app = express();
